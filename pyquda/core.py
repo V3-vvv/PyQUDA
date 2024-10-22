@@ -2,27 +2,34 @@ from typing import List, Literal, Union
 
 import numpy
 
-from . import getDefaultLattice, getLogger
+from . import getDefaultLattice, getLogger, dirac as fermion
 from .field import (
     Ns,
     Nc,
     Nd,
+    X,
+    Y,
+    Z,
+    T,
     LatticeInfo,
     LatticeGauge,
+    LatticeMom,
     LatticeFermion,
-    LatticePropagator,
+    MultiLatticeFermion,
     LatticeStaggeredFermion,
+    MultiLatticeStaggeredFermion,
+    LatticePropagator,
     LatticeStaggeredPropagator,
     lexico,
     cb2,
 )
-from .dirac import Multigrid, Dirac, StaggeredDirac
-from .utils.source import source
+from .dirac.abstract import Multigrid, FermionDirac, StaggeredFermionDirac
+from .utils import source
 from .deprecated import smear, smear4, invert12, getDslash, getStaggeredDslash
 
 
 def invert(
-    dirac: Dirac,
+    dirac: FermionDirac,
     source_type: Literal["point", "wall", "volume", "momentum", "colorvector"],
     t_srce: Union[List[int], int, None],
     source_phase=None,
@@ -33,7 +40,7 @@ def invert(
     propag = LatticePropagator(latt_info)
     for spin in range(Ns):
         for color in range(Nc):
-            b = source(latt_info, source_type, t_srce, spin, color, source_phase)
+            b = source.source(latt_info, source_type, t_srce, spin, color, source_phase)
             x = dirac.invertRestart(b, restart)
             propag.setFermion(x, spin, color)
 
@@ -41,7 +48,7 @@ def invert(
 
 
 def invertPropagator(
-    dirac: Dirac,
+    dirac: FermionDirac,
     source_propag: LatticePropagator,
     restart: int = 0,
 ):
@@ -58,7 +65,7 @@ def invertPropagator(
 
 
 def invertStaggered(
-    dirac: StaggeredDirac,
+    dirac: StaggeredFermionDirac,
     source_type: Literal["point", "wall", "volume", "momentum", "colorvector"],
     t_srce: Union[List[int], int, None],
     source_phase=None,
@@ -68,7 +75,7 @@ def invertStaggered(
 
     propag = LatticeStaggeredPropagator(latt_info)
     for color in range(Nc):
-        b = source(latt_info, source_type, t_srce, None, color, source_phase)
+        b = source.source(latt_info, source_type, t_srce, None, color, source_phase)
         x = dirac.invertRestart(b, restart)
         propag.setFermion(x, color)
 
@@ -76,7 +83,7 @@ def invertStaggered(
 
 
 def invertStaggeredPropagator(
-    dirac: StaggeredDirac,
+    dirac: StaggeredFermionDirac,
     source_propag: LatticeStaggeredPropagator,
     restart: int = 0,
 ):
@@ -191,13 +198,9 @@ def getDirac(
             multigrid = [[2, 2, 2, 2], [4, 4, 4, 4]]
 
     if clover_csw != 0.0:
-        from .dirac.clover_wilson import CloverWilson
-
-        return CloverWilson(latt_info, mass, kappa, tol, maxiter, clover_csw, clover_xi, multigrid)
+        return fermion.CloverWilsonDirac(latt_info, mass, kappa, tol, maxiter, clover_csw, clover_xi, multigrid)
     else:
-        from .dirac.wilson import Wilson
-
-        return Wilson(latt_info, mass, kappa, tol, maxiter, multigrid)
+        return fermion.WilsonDirac(latt_info, mass, kappa, tol, maxiter, multigrid)
 
 
 def getStaggeredDirac(
@@ -211,9 +214,7 @@ def getStaggeredDirac(
     assert latt_info.anisotropy == 1.0
     kappa = 1 / 2
 
-    from .dirac.hisq import HISQ
-
-    return HISQ(latt_info, mass, kappa, tol, maxiter, tadpole_coeff, naik_epsilon, None)
+    return fermion.HISQDirac(latt_info, mass, kappa, tol, maxiter, naik_epsilon, None)
 
 
 def getWilson(
@@ -231,9 +232,7 @@ def getWilson(
         if not isinstance(multigrid, list) and not isinstance(multigrid, Multigrid):
             multigrid = [[2, 2, 2, 2], [4, 4, 4, 4]]
 
-    from .dirac.wilson import Wilson
-
-    return Wilson(latt_info, mass, kappa, tol, maxiter, multigrid)
+    return fermion.WilsonDirac(latt_info, mass, kappa, tol, maxiter, multigrid)
 
 
 def getClover(
@@ -261,9 +260,20 @@ def getClover(
         if not isinstance(multigrid, list) and not isinstance(multigrid, Multigrid):
             multigrid = [[2, 2, 2, 2], [4, 4, 4, 4]]
 
-    from .dirac.clover_wilson import CloverWilson
+    return fermion.CloverWilsonDirac(latt_info, mass, kappa, tol, maxiter, clover_csw, clover_xi, multigrid)
 
-    return CloverWilson(latt_info, mass, kappa, tol, maxiter, clover_csw, clover_xi, multigrid)
+
+def getStaggered(
+    latt_info: LatticeInfo,
+    mass: float,
+    tol: float,
+    maxiter: int,
+    tadpole_coeff: float = 1.0,
+):
+    assert latt_info.anisotropy == 1.0
+    kappa = 1 / 2
+
+    return fermion.StaggeredDirac(latt_info, mass, kappa, tol, maxiter, tadpole_coeff, None)
 
 
 def getHISQ(
@@ -271,15 +281,12 @@ def getHISQ(
     mass: float,
     tol: float,
     maxiter: int,
-    tadpole_coeff: float = 1.0,
     naik_epsilon: float = 0.0,
 ):
     assert latt_info.anisotropy == 1.0
     kappa = 1 / 2  # to be compatible with mass normalization
 
-    from .dirac.hisq import HISQ
-
-    return HISQ(latt_info, mass, kappa, tol, maxiter, tadpole_coeff, naik_epsilon, None)
+    return fermion.HISQDirac(latt_info, mass, kappa, tol, maxiter, naik_epsilon, None)
 
 
 def getDefaultDirac(

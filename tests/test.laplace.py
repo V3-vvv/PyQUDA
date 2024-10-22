@@ -10,10 +10,10 @@ from check_pyquda import weak_field
 from pyquda import init, core, enum_quda, quda
 from pyquda.field import LatticeGauge, LaplaceLatticeInfo, LatticeStaggeredFermion, MultiLatticeStaggeredFermion, Nc
 from pyquda.utils import io
-from pyquda.dirac import setPrecision
+from pyquda.dirac import setGlobalPrecision
 
 init(resource_path=".cache")
-setPrecision(eigensolver=8)
+setGlobalPrecision(eigensolver=8)
 
 t = 3
 
@@ -70,9 +70,9 @@ evals, evecs = linalg.eigsh(A, n_ev, which="SA", tol=tol)
 print(f"{perf_counter() - s:.3f} secs")
 print(evals)
 
-gauge_tmp.pure_gauge.loadGauge(gauge_tmp)
+gauge_tmp._gauge_dirac.loadGauge(gauge_tmp)
 eig_param = quda.QudaEigParam()
-eig_param.invert_param = gauge_tmp.pure_gauge.invert_param
+eig_param.invert_param = gauge_tmp._gauge_dirac.invert_param
 eig_param.eig_type = enum_quda.QudaEigType.QUDA_EIG_TR_LANCZOS
 eig_param.use_dagger = enum_quda.QudaBoolean.QUDA_BOOLEAN_FALSE
 eig_param.use_norm_op = enum_quda.QudaBoolean.QUDA_BOOLEAN_FALSE

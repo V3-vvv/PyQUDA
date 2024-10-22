@@ -1,13 +1,13 @@
 from typing import List, Union
 
-from ..field import LatticeInfo, LatticeGauge, LatticeClover
-from ..enum_quda import QudaDslashType, QudaPrecision
+from ..field import LatticeInfo, LatticeGauge
+from ..enum_quda import QudaDslashType, QudaInverterType, QudaReconstructType, QudaPrecision
 
 from . import general
-from .abstract import Multigrid, FermionDirac
+from .abstract import Multigrid, StaggeredFermionDirac
 
 
-class CloverWilsonDirac(FermionDirac):
+class StaggeredDirac(StaggeredFermionDirac):
     def __init__(
         self,
         latt_info: LatticeInfo,
@@ -15,25 +15,28 @@ class CloverWilsonDirac(FermionDirac):
         kappa: float,
         tol: float,
         maxiter: int,
-        clover_csw: float = 0.0,
-        clover_xi: float = 1.0,
+        tadpole_coeff: float = 1.0,
         multigrid: Union[List[List[int]], Multigrid] = None,
     ) -> None:
         super().__init__(latt_info)
-        self.clover: LatticeClover = None
-        self.clover_inv: LatticeClover = None
-        self.newQudaGaugeParam()
+        self.newQudaGaugeParam(tadpole_coeff)
         self.newQudaMultigridParam(multigrid, mass, kappa, 0.25, 16, 1e-6, 1000, 0, 8)
-        self.newQudaInvertParam(mass, kappa, tol, maxiter, clover_csw, clover_xi)
+        self.newQudaInvertParam(mass, kappa, tol, maxiter)
         # Using half with multigrid doesn't work
         if multigrid is not None:
             self.setPrecision(sloppy=max(self.precision.sloppy, QudaPrecision.QUDA_SINGLE_PRECISION))
         else:
             self.setPrecision()
-        self.setReconstruct()
+        self.setReconstruct(
+            cuda=max(self.reconstruct.cuda, QudaReconstructType.QUDA_RECONSTRUCT_NO),
+            sloppy=max(self.reconstruct.sloppy, QudaReconstructType.QUDA_RECONSTRUCT_NO),
+            precondition=max(self.reconstruct.precondition, QudaReconstructType.QUDA_RECONSTRUCT_NO),
+            eigensolver=max(self.reconstruct.eigensolver, QudaReconstructType.QUDA_RECONSTRUCT_NO),
+        )
 
-    def newQudaGaugeParam(self):
-        gauge_param = general.newQudaGaugeParam(self.latt_info, 1.0, 0.0)
+    def newQudaGaugeParam(self, tadpole_coeff: float):
+        gauge_param = general.newQudaGaugeParam(self.latt_info, tadpole_coeff, 0.0)
+        gauge_param.staggered_phase_applied = 1
         self.gauge_param = gauge_param
 
     def newQudaMultigridParam(
@@ -63,34 +66,20 @@ class CloverWilsonDirac(FermionDirac):
                 nu_pre,
                 nu_post,
             )
-            mg_inv_param.dslash_type = QudaDslashType.QUDA_CLOVER_WILSON_DSLASH
+            mg_inv_param.dslash_type = QudaDslashType.QUDA_ASQTAD_DSLASH
             self.multigrid = Multigrid(mg_param, mg_inv_param)
         else:
             self.multigrid = Multigrid(None, None)
 
-    def newQudaInvertParam(
-        self, mass: float, kappa: float, tol: float, maxiter: int, clover_csw: float, clover_xi: float
-    ):
-        invert_param = general.newQudaInvertParam(
-            mass, kappa, tol, maxiter, kappa * clover_csw, clover_xi, self.multigrid.param
-        )
-        invert_param.dslash_type = QudaDslashType.QUDA_CLOVER_WILSON_DSLASH
+    def newQudaInvertParam(self, mass: float, kappa: float, tol: float, maxiter: int):
+        invert_param = general.newQudaInvertParam(mass, kappa, tol, maxiter, 0.0, 1.0, self.multigrid.param)
+        invert_param.dslash_type = QudaDslashType.QUDA_STAGGERED_DSLASH
+        if self.multigrid.param is None:
+            invert_param.inv_type = QudaInverterType.QUDA_CG_INVERTER
         self.invert_param = invert_param
 
-    def saveClover(self, gauge: LatticeGauge):
-        if self.clover is None or self.clover_inv is None:
-            self.clover = LatticeClover(gauge.latt_info)
-            self.clover_inv = LatticeClover(gauge.latt_info)
-        general.saveClover(self.clover, self.clover_inv, gauge, self.gauge_param, self.invert_param)
-
-    def restoreClover(self):
-        assert self.clover is not None and self.clover_inv is not None
-        general.loadClover(self.clover, self.clover_inv, None, self.gauge_param, self.invert_param)
-        self.updateMultigrid(True)
-
     def loadGauge(self, gauge: LatticeGauge, thin_update_only: bool = False):
-        general.loadClover(self.clover, self.clover_inv, gauge, self.gauge_param, self.invert_param)
-        general.loadGauge(gauge, self.gauge_param)
+        general.loadStaggeredGauge(gauge, self.gauge_param)
         if self.multigrid.instance is None:
             self.newMultigrid()
         else:

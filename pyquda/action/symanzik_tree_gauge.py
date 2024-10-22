@@ -3,11 +3,11 @@ import numpy
 from ..pointer import Pointers
 from ..pyquda import computeGaugeLoopTraceQuda, computeGaugeForceQuda
 from ..field import Nc, LatticeInfo
-from ..dirac.pure_gauge import PureGauge
+from ..dirac import GaugeDirac
 
 nullptr = Pointers("void", 0)
 
-from . import GaugeAction
+from .abstract import Action
 
 
 def loop_ndarray(path, num_paths, max_length):
@@ -60,12 +60,13 @@ def path_force(path, coeffs):
     return path, num_paths, max_length, lengths, coeffs, fpath, num_fpaths, max_flength, flengths, fcoeffs
 
 
-class SymanzikGauge(GaugeAction):
-    def __init__(self, latt_info: LatticeInfo, beta: float, u_0: float):
-        super().__init__(latt_info)
+class SymanzikTreeGauge(Action):
+    R"""
+    \beta' = \beta * (5 / 3) / u_0**4
+    """
 
-        self.pure_gauge = PureGauge(latt_info)
-        self.gauge_param = self.pure_gauge.gauge_param
+    def __init__(self, latt_info: LatticeInfo, beta: float, u_0: float):
+        super().__init__(latt_info, GaugeDirac(latt_info))
 
         input_path = [
             [0, 1, 7, 6],
@@ -119,8 +120,8 @@ class SymanzikGauge(GaugeAction):
             self.flengths,
             self.fcoeffs,
         ) = path_force(input_path, input_coeffs)
-        self.coeffs *= beta * (5 / 3) / u_0**4 / Nc
-        self.fcoeffs *= beta * (5 / 3) / u_0**4 / Nc
+        self.coeffs *= beta / Nc
+        self.fcoeffs *= beta / Nc
 
     def action(self) -> float:
         traces = numpy.zeros((self.num_paths), "<c16")

@@ -2,7 +2,6 @@ from typing import List, Literal, Union
 
 import numpy
 
-from ..pointer import ndarrayPointer
 from ..pyquda import (
     QudaGaugeSmearParam,
     QudaGaugeObservableParam,
@@ -24,7 +23,15 @@ from ..pyquda import (
     computeGaugeFixingOVRQuda,
     computeGaugeFixingFFTQuda,
 )
-from ..field import LatticeInfo, LatticeGauge, LatticeMom, LatticeFermion, LatticeStaggeredFermion
+from ..field import (
+    LatticeInfo,
+    LaplaceLatticeInfo,
+    LatticeGauge,
+    LatticeMom,
+    LatticeFermion,
+    LatticeStaggeredFermion,
+    LatticeFloat64,
+)
 from ..enum_quda import (
     QudaBoolean,
     QudaDslashType,
@@ -35,30 +42,32 @@ from ..enum_quda import (
     QudaSolveType,
 )
 
-from . import Gauge, general
+from . import general
+from .abstract import Dirac
 
 
-class PureGauge(Gauge):
-    def __init__(self, latt_info: LatticeInfo) -> None:
-        super().__init__(latt_info)
+class GaugeDirac(Dirac):
+    def __init__(self, latt_info: Union[LatticeInfo, LaplaceLatticeInfo]) -> None:
+        super().__init__(latt_info.__class__(latt_info.global_size))  # Keep periodic t boundary and isotropic
+        self.newQudaGaugeParam()
+        self.newQudaInvertParam()
+        self.newQudaGaugeSmearParam()
+        self.newQudaGaugeObservableParam()
+        self.setPrecision()
         # Use QUDA_RECONSTRUCT_NO to ensure slight deviations from SU(3) can be preserved
-        self._setReconstruct(
+        self.setReconstruct(
             cuda=max(self.reconstruct.cuda, QudaReconstructType.QUDA_RECONSTRUCT_NO),
             sloppy=max(self.reconstruct.sloppy, QudaReconstructType.QUDA_RECONSTRUCT_NO),
             precondition=max(self.reconstruct.precondition, QudaReconstructType.QUDA_RECONSTRUCT_NO),
             eigensolver=max(self.reconstruct.eigensolver, QudaReconstructType.QUDA_RECONSTRUCT_NO),
         )
-        self.newQudaGaugeParam()
-        self.newQudaInvertParam()
-        self.newQudaGaugeSmearParam()
-        self.newQudaGaugeObservableParam()
 
     def newQudaGaugeParam(self):
-        gauge_param = general.newQudaGaugeParam(self.latt_info, 1.0, 0.0, self.precision, self.reconstruct)
+        gauge_param = general.newQudaGaugeParam(self.latt_info, 1.0, 0.0)
         self.gauge_param = gauge_param
 
     def newQudaInvertParam(self):
-        invert_param = general.newQudaInvertParam(0, 1 / 8, 0, 0, 0.0, 1.0, None, self.precision)
+        invert_param = general.newQudaInvertParam(0, 1 / 8, 0, 0, 0.0, 1.0, None)
         invert_param.solve_type = QudaSolveType.QUDA_DIRECT_SOLVE
         invert_param.mass_normalization = QudaMassNormalization.QUDA_KAPPA_NORMALIZATION
         self.invert_param = invert_param
@@ -129,15 +138,16 @@ class PureGauge(Gauge):
         performWuppertalnStep(b.data_ptr, x.data_ptr, self.invert_param, n_steps, alpha)
         return b
 
-    def staggeredPhase(self, gauge: LatticeGauge):
+    def staggeredPhase(self, gauge: LatticeGauge, applied: bool = False):
         self.gauge_param.use_resident_gauge = 0
         self.gauge_param.make_resident_gauge = 0
         self.gauge_param.return_result_gauge = 1
+        self.gauge_param.staggered_phase_applied = int(applied)
         staggeredPhaseQuda(gauge.data_ptrs, self.gauge_param)
-        self.gauge_param.staggered_phase_applied = 1 - self.gauge_param.staggered_phase_applied
         self.gauge_param.use_resident_gauge = 1
         self.gauge_param.make_resident_gauge = 1
         self.gauge_param.return_result_gauge = 0
+        self.gauge_param.staggered_phase_applied = int(not applied)
 
     def projectSU3(self, gauge: LatticeGauge, tol: float):
         self.gauge_param.use_resident_gauge = 0
@@ -167,12 +177,12 @@ class PureGauge(Gauge):
     ):
         gauge_path = LatticeGauge(gauge.latt_info)
         num_paths = 1
-        input_path_buf_x, path_length = PureGauge._getPath(paths[0])
+        input_path_buf_x, path_length = GaugeDirac._getPath(paths[0])
         input_path_buf = numpy.zeros((4, 1, path_length + 1), "<i4")
         input_path_buf[0, 0, 0] = 7
         input_path_buf[0, 0, 1:] = input_path_buf_x
         for d in range(1, 4):
-            input_path_buf_, path_length_ = PureGauge._getPath(paths[d])
+            input_path_buf_, path_length_ = GaugeDirac._getPath(paths[d])
             assert path_length_ == path_length, "paths in all directions should have the same shape"
             input_path_buf[d, 0, 0] = 7 - d
             input_path_buf[d, 0, 1:] = input_path_buf_
@@ -205,7 +215,7 @@ class PureGauge(Gauge):
         for i in range(num_paths):
             path_length[i] = len(loops[i])
         max_length = int(numpy.max(path_length))
-        input_path_buf = numpy.zeros((num_paths, max_length), "<i4")
+        input_path_buf = numpy.full((num_paths, max_length), -1, "<i4")
         for i in range(num_paths):
             dx = [0, 0, 0, 0]
             for j, d in enumerate(loops[i]):
@@ -228,12 +238,12 @@ class PureGauge(Gauge):
         coeff: List[float],
     ):
         gauge_loop = LatticeGauge(gauge.latt_info)
-        input_path_buf_x, path_length, num_paths, max_length = PureGauge._getLoops(loops[0])
+        input_path_buf_x, path_length, num_paths, max_length = GaugeDirac._getLoops(loops[0])
         input_path_buf = numpy.zeros((4, num_paths, max_length + 1), "<i4")
         input_path_buf[0, :, 0] = 7
         input_path_buf[0, :, 1:] = input_path_buf_x
         for d in range(1, 4):
-            input_path_buf_, path_length_, num_paths_, max_length_ = PureGauge._getLoops(loops[d])
+            input_path_buf_, path_length_, num_paths_, max_length_ = GaugeDirac._getLoops(loops[d])
             assert (path_length_ == path_length).all(), "paths in all directions should have the same shape"
             input_path_buf[d, :, 0] = 7 - d
             input_path_buf[d, :, 1:] = input_path_buf_
@@ -258,7 +268,7 @@ class PureGauge(Gauge):
         return gauge_loop
 
     def loopTrace(self, loops: List[List[int]]):
-        input_path_buf, path_length, num_paths, max_length = PureGauge._getLoops(loops)
+        input_path_buf, path_length, num_paths, max_length = GaugeDirac._getLoops(loops)
         traces = numpy.zeros((num_paths), "<c16")
         loop_coeff = numpy.ones((num_paths), "<f8")
         computeGaugeLoopTraceQuda(
@@ -355,13 +365,12 @@ class PureGauge(Gauge):
         return self.obs_param.qcharge
 
     def qchargeDensity(self):
-        qcharge_density = numpy.zeros((self.latt_info.volume), "<f8")
-        self.obs_param.qcharge_density = ndarrayPointer(qcharge_density, True)
+        qcharge_density = LatticeFloat64(self.latt_info)
+        self.obs_param.qcharge_density = qcharge_density.data_ptr
         self.obs_param.compute_qcharge_density = QudaBoolean.QUDA_BOOLEAN_TRUE
         gaugeObservablesQuda(self.obs_param)
         self.obs_param.compute_qcharge_density = QudaBoolean.QUDA_BOOLEAN_TRUE
-        Lx, Ly, Lz, Lt = self.latt_info.size
-        return qcharge_density.reshape(2, Lt, Lz, Ly, Lx // 2)
+        return qcharge_density
 
     def gaussGauge(self, seed: int, sigma: float):
         gaussGaugeQuda(seed, sigma)
