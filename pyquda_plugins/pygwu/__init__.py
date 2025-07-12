@@ -192,7 +192,7 @@ class Overlap:
         gauge_in = gauge.copy()
         if self.latt_info.t_boundary == -1:
             gauge_in.setAntiPeriodicT()
-        gwu.gwu_build_hw(gauge_in.data_ptrs, kappa)
+        gwu.gwu_build_hw(gauge_in.data_ptrs.flatten(), kappa)
 
     def loadHWilsonEigen(self, eignum: int, eigprec: float, file: str, use_fp32: bool, chunk: bool = False):
         if chunk:
