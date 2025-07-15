@@ -8,7 +8,7 @@ from pyquda_plugins import pygwu
 
 # init([1, 1, 1, 1], [8, 8, 8, 8], backend="numpy", resource_path=".cache")
 # latt_info = LatticeInfo([8, 8, 8, 8], 1, 1)
-init([4, 1, 1, 1], [24, 24, 24, 64], backend="numpy", resource_path=".cache")
+init([1, 1, 1, 4], [24, 24, 24, 64], backend="numpy", resource_path=".cache")
 latt_info = LatticeInfo([24, 24, 24, 64], 1, 1)
 Lx, Ly, Lz, Lt = latt_info.size
 kappa = 0.2
