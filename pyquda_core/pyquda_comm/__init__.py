@@ -430,18 +430,141 @@ def getSubarray(dtype: DTypeLike, shape: Sequence[int], axes: Sequence[int]):
     return native_dtype_str, dtlib.from_numpy_dtype(native_dtype_str).Create_subarray(sizes, subsizes, starts)
 
 
-def readMPIFile(filename: str, dtype: DTypeLike, offset: int, shape: Sequence[int], axes: Sequence[int]) -> NDArray:
-    native_dtype_str, filetype = getSubarray(dtype, shape, axes)
-    buf = numpy.empty(shape, native_dtype_str)
+# def readMPIFile(filename: str, dtype: DTypeLike, offset: int, shape: Sequence[int], axes: Sequence[int]) -> NDArray:
+#     native_dtype_str, filetype = getSubarray(dtype, shape, axes)
+#     buf = numpy.empty(shape, native_dtype_str)
 
-    fh = MPI.File.Open(getMPIComm(), filename, MPI.MODE_RDONLY)
-    filetype.Commit()
-    fh.Set_view(disp=offset, filetype=filetype)
-    fh.Read_all(buf)
-    filetype.Free()
-    fh.Close()
+#     fh = MPI.File.Open(getMPIComm(), filename, MPI.MODE_RDONLY)
+#     filetype.Commit()
+#     fh.Set_view(disp=offset, filetype=filetype)
+#     fh.Read_all(buf)
+#     filetype.Free()
+#     fh.Close()
 
-    return buf.view(dtype)
+#     return buf.view(dtype)
+
+def readMPIFile(
+    filename: str,
+    dtype: DTypeLike,
+    offset: int,
+    shape: Sequence[int],
+    axes: Sequence[int],
+    io_procs: int
+) -> NDArray:
+    """
+    使用MPI聚合I/O策略并行读取文件。
+    少数进程(io_procs)负责读取大块数据，然后通过Alltoallw分发。
+
+    Parameters
+    ----------
+    filename:
+        文件名。
+    dtype:
+        数据类型。
+    offset:
+        文件读取的起始偏移量。
+    shape:
+        每个进程期望读取的数据的本地形状 (local shape)。
+    axes:
+        需要跨进程分布的全局数组的轴。
+    io_procs:
+        用于I/O的聚合器进程数量。
+    """
+    comm = getMPIComm()
+    rank = getMPIRank()
+    grid = getGridSize()
+    comm_size = getMPISize()
+
+    if comm_size % io_procs != 0:
+        if rank == 0:
+            print(f"Error: Total processes ({comm_size}) must be divisible by I/O processes ({io_procs}).")
+        comm.Abort(1)
+
+    numpy_dtype = numpy.dtype(dtype)
+    native_dtype_str = numpy_dtype.str.replace('>', '<') if numpy_dtype.str.startswith('>') else numpy_dtype.str
+    native_dtype = numpy.dtype(native_dtype_str)
+    itemsize = native_dtype.itemsize
+
+    is_io_proc = rank < io_procs
+    io_comm = comm.Split(color=0 if is_io_proc else 1, key=rank)
+    io_rank = io_comm.Get_rank() if is_io_proc else -1
+    procs_per_io_node = comm_size // io_procs
+    
+    io_buf = None
+    send_buf = None
+
+    if is_io_proc:
+        # Phase 1: I/O聚合器从文件中读取大块数据
+        aggregator_shape = list(shape)
+        fastest_changing_axis_in_grid = axes[-1]
+        aggregator_shape[fastest_changing_axis_in_grid] *= procs_per_io_node
+        
+        io_buf = numpy.empty(tuple(aggregator_shape), dtype=native_dtype)
+        
+        global_sizes = list(shape)
+        for j, i in enumerate(axes):
+            global_sizes[i] *= grid[j]
+
+        start_rank_in_block = io_rank * procs_per_io_node
+        # 使用库提供的函数进行Rank/Coordinate转换，以支持不同的grid_map
+        start_coords = getCoordFromRank(start_rank_in_block)
+        
+        block_starts = [0] * len(shape)
+        for j, i in enumerate(axes):
+            proc_dim_size = shape[i]
+            block_starts[i] = start_coords[j] * proc_dim_size
+
+        filetype_dtype_base = dtlib.from_numpy_dtype(native_dtype)
+        filetype = filetype_dtype_base.Create_subarray(global_sizes, tuple(aggregator_shape), block_starts)
+        filetype.Commit()
+
+        fh = MPI.File.Open(io_comm, filename, MPI.MODE_RDONLY)
+        fh.Set_view(disp=offset, filetype=filetype)
+        fh.Read_all(io_buf)
+        fh.Close()
+        filetype.Free()
+
+        # 数据重排：为Alltoallw准备一个数据连续的发送缓冲区
+        send_buf = numpy.empty(io_buf.shape, dtype=native_dtype)
+        local_shape_t = shape[fastest_changing_axis_in_grid]
+        
+        for i in range(procs_per_io_node):
+            source_slice = [slice(None)] * len(aggregator_shape)
+            source_slice[fastest_changing_axis_in_grid] = slice(i * local_shape_t, (i + 1) * local_shape_t)
+            
+            dest_start = i * (numpy.prod(shape))
+            dest_end = (i + 1) * (numpy.prod(shape))
+            
+            send_buf.ravel()[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
+
+    # Phase 2: 所有进程参与数据分发
+    sendcounts = numpy.zeros(comm_size, dtype=int)
+    recvcounts = numpy.zeros(comm_size, dtype=int)
+    sdispls = numpy.zeros(comm_size, dtype=int)
+    rdispls = numpy.zeros(comm_size, dtype=int)
+    sendtypes = [MPI.BYTE] * comm_size
+    recvtypes = [MPI.BYTE] * comm_size
+    
+    my_io_source_rank = (rank // procs_per_io_node)
+    local_data_size_bytes = numpy.prod(shape) * itemsize
+    recvcounts[my_io_source_rank] = local_data_size_bytes
+
+    if is_io_proc:
+        start_target_rank = rank * procs_per_io_node
+        for i in range(procs_per_io_node):
+            target_rank = start_target_rank + i
+            sendcounts[target_rank] = local_data_size_bytes
+            sdispls[target_rank] = i * local_data_size_bytes
+            
+    buf = numpy.empty(shape, dtype=native_dtype)
+    comm.Barrier()
+    
+    comm.Alltoallw(
+        [send_buf, sendcounts, sdispls, sendtypes],
+        [buf, recvcounts, rdispls, recvtypes]
+    )
+
+    return buf.view(numpy_dtype)
 
 
 def readMPIFileInChunks(

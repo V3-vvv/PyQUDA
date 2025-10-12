@@ -3,7 +3,7 @@ from typing import List
 
 import numpy
 
-from pyquda_comm import getSublatticeSize, readMPIFile, writeMPIFile
+from pyquda_comm import getSublatticeSize, readMPIFile, writeMPIFile, _MPI_COMM
 from .io_utils import propagatorFromDiracPauli, propagatorToDiracPauli
 
 Nd, Ns, Nc = 4, 4, 3
@@ -14,7 +14,15 @@ def readGauge(filename: str, latt_size: List[int]):
     Lx, Ly, Lz, Lt = getSublatticeSize(latt_size)
     dtype, offset = ">f8", 0
 
-    gauge = readMPIFile(filename, dtype, offset, (Nd, Nc, Nc, 2, Lt, Lz, Ly, Lx), (7, 6, 5, 4))
+    # gauge = readMPIFile(filename, dtype, offset, (Nd, Nc, Nc, 2, Lt, Lz, Ly, Lx), (7, 6, 5, 4))
+
+    # Test readMPIFile_aggregator
+    num_io_procs = 16 # Number of MPI processes to use for I/O
+    comm_size = _MPI_COMM.Get_size()
+    if comm_size < num_io_procs:
+        num_io_procs = comm_size
+    gauge = readMPIFile(filename, dtype, offset, (Nd, Nc, Nc, 2, Lt, Lz, Ly, Lx), (7, 6, 5, 4), num_io_procs)
+
     gauge = (
         gauge.transpose(0, 4, 5, 6, 7, 2, 1, 3)
         .astype("<f8")
