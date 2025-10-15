@@ -453,7 +453,7 @@ def readMPIFile(
 ) -> NDArray:
     """
     使用MPI聚合I/O策略并行读取文件。
-    少数进程(io_procs)负责读取大块数据，然后通过Alltoallw分发。
+    少数进程(io_procs)负责读取大块数据，组内第一个进程作为 I/O leader，然后通过Alltoallw分发。
 
     Parameters
     ----------
@@ -485,16 +485,21 @@ def readMPIFile(
     native_dtype = numpy.dtype(native_dtype_str)
     itemsize = native_dtype.itemsize
 
-    is_io_proc = rank < io_procs
+    procs_per_io_node = comm_size // io_procs
+    
+    # 核心优化：每组的第一个进程作为 I/O leader
+    is_io_proc = (rank % procs_per_io_node) == 0
+    my_io_group = rank // procs_per_io_node
+    my_io_leader = my_io_group * procs_per_io_node
+    
     io_comm = comm.Split(color=0 if is_io_proc else 1, key=rank)
     io_rank = io_comm.Get_rank() if is_io_proc else -1
-    procs_per_io_node = comm_size // io_procs
     
     io_buf = None
     send_buf = None
 
     if is_io_proc:
-        # Phase 1: I/O聚合器从文件中读取大块数据
+        # Phase 1: I/O 进程读取数据
         aggregator_shape = list(shape)
         fastest_changing_axis_in_grid = axes[-1]
         aggregator_shape[fastest_changing_axis_in_grid] *= procs_per_io_node
@@ -506,7 +511,6 @@ def readMPIFile(
             global_sizes[i] *= grid[j]
 
         start_rank_in_block = io_rank * procs_per_io_node
-        # 使用库提供的函数进行Rank/Coordinate转换，以支持不同的grid_map
         start_coords = getCoordFromRank(start_rank_in_block)
         
         block_starts = [0] * len(shape)
@@ -524,7 +528,7 @@ def readMPIFile(
         fh.Close()
         filetype.Free()
 
-        # 数据重排：为Alltoallw准备一个数据连续的发送缓冲区
+        # 数据重排
         send_buf = numpy.empty(io_buf.shape, dtype=native_dtype)
         local_shape_t = shape[fastest_changing_axis_in_grid]
         
@@ -537,7 +541,7 @@ def readMPIFile(
             
             send_buf.ravel()[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
 
-    # Phase 2: 所有进程参与数据分发
+    # Phase 2: 数据分发
     sendcounts = numpy.zeros(comm_size, dtype=int)
     recvcounts = numpy.zeros(comm_size, dtype=int)
     sdispls = numpy.zeros(comm_size, dtype=int)
@@ -545,12 +549,11 @@ def readMPIFile(
     sendtypes = [MPI.BYTE] * comm_size
     recvtypes = [MPI.BYTE] * comm_size
     
-    my_io_source_rank = (rank // procs_per_io_node)
     local_data_size_bytes = numpy.prod(shape) * itemsize
-    recvcounts[my_io_source_rank] = local_data_size_bytes
+    recvcounts[my_io_leader] = local_data_size_bytes
 
     if is_io_proc:
-        start_target_rank = rank * procs_per_io_node
+        start_target_rank = my_io_group * procs_per_io_node
         for i in range(procs_per_io_node):
             target_rank = start_target_rank + i
             sendcounts[target_rank] = local_data_size_bytes
