@@ -485,63 +485,84 @@ def readMPIFile(
     native_dtype = numpy.dtype(native_dtype_str)
     itemsize = native_dtype.itemsize
 
+    # 计算每个I/O进程负责的普通进程数量
     procs_per_io_node = comm_size // io_procs
     
-    # 核心优化：每组的第一个进程作为 I/O leader
+    # 每组的第一个进程作为I/O leader
     is_io_proc = (rank % procs_per_io_node) == 0
     my_io_group = rank // procs_per_io_node
     my_io_leader = my_io_group * procs_per_io_node
     
-    io_comm = comm.Split(color=0 if is_io_proc else 1, key=rank)
-    io_rank = io_comm.Get_rank() if is_io_proc else -1
-    
-    io_buf = None
     send_buf = None
 
     if is_io_proc:
-        # Phase 1: I/O 进程读取数据
+        # Phase 1: I/O进程聚合读取数据
+        
+        # 计算该I/O进程负责的进程组
+        group_ranks = [my_io_leader + i for i in range(procs_per_io_node)]
+        group_coords = [getCoordFromRank(r) for r in group_ranks]
+        
+        # 根据组内进程的坐标范围计算聚合形状
         aggregator_shape = list(shape)
-        fastest_changing_axis_in_grid = axes[-1]
-        aggregator_shape[fastest_changing_axis_in_grid] *= procs_per_io_node
+        min_coords = [min(coord[j] for coord in group_coords) for j in range(len(axes))]
+        max_coords = [max(coord[j] for coord in group_coords) for j in range(len(axes))]
+        
+        for j, i in enumerate(axes):
+            aggregator_shape[i] = shape[i] * (max_coords[j] - min_coords[j] + 1)
         
         io_buf = numpy.empty(tuple(aggregator_shape), dtype=native_dtype)
         
+        # 创建MPI文件类型以描述在全局数组中的读取位置
         global_sizes = list(shape)
         for j, i in enumerate(axes):
             global_sizes[i] *= grid[j]
-
-        start_rank_in_block = io_rank * procs_per_io_node
-        start_coords = getCoordFromRank(start_rank_in_block)
         
+        start_coords = getCoordFromRank(rank)
         block_starts = [0] * len(shape)
         for j, i in enumerate(axes):
-            proc_dim_size = shape[i]
-            block_starts[i] = start_coords[j] * proc_dim_size
+            block_starts[i] = start_coords[j] * shape[i]
 
         filetype_dtype_base = dtlib.from_numpy_dtype(native_dtype)
         filetype = filetype_dtype_base.Create_subarray(global_sizes, tuple(aggregator_shape), block_starts)
         filetype.Commit()
 
-        fh = MPI.File.Open(io_comm, filename, MPI.MODE_RDONLY)
-        fh.Set_view(disp=offset, filetype=filetype)
-        fh.Read_all(io_buf)
-        fh.Close()
+        # 创建I/O子通信器并读取数据
+        io_comm = comm.Split(color=0 if is_io_proc else MPI.UNDEFINED, key=rank)
+        
+        if io_comm != MPI.COMM_NULL:
+            fh = MPI.File.Open(io_comm, filename, MPI.MODE_RDONLY)
+            fh.Set_view(disp=offset, filetype=filetype)
+            fh.Read_all(io_buf)
+            fh.Close()
+            io_comm.Free()
+        
         filetype.Free()
 
-        # 数据重排
-        send_buf = numpy.empty(io_buf.shape, dtype=native_dtype)
-        local_shape_t = shape[fastest_changing_axis_in_grid]
+        # 数据重排：根据目标进程的实际坐标从io_buf中提取对应数据
+        send_buf = numpy.empty(procs_per_io_node * numpy.prod(shape), dtype=native_dtype)
         
-        for i in range(procs_per_io_node):
-            source_slice = [slice(None)] * len(aggregator_shape)
-            source_slice[fastest_changing_axis_in_grid] = slice(i * local_shape_t, (i + 1) * local_shape_t)
+        for i, target_rank in enumerate(group_ranks):
+            target_coords = getCoordFromRank(target_rank)
             
-            dest_start = i * (numpy.prod(shape))
-            dest_end = (i + 1) * (numpy.prod(shape))
+            # 计算目标进程在io_buf中的多维切片位置
+            source_slice = []
+            for dim in range(len(shape)):
+                if dim in axes:
+                    j = axes.index(dim)
+                    offset_in_dim = target_coords[j] - min_coords[j]
+                    source_slice.append(slice(offset_in_dim * shape[dim], (offset_in_dim + 1) * shape[dim]))
+                else:
+                    source_slice.append(slice(None))
+            
+            dest_start = i * numpy.prod(shape)
+            dest_end = (i + 1) * numpy.prod(shape)
             
             send_buf.ravel()[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
+    else:
+        # 非I/O进程也需要参与Split以避免死锁
+        io_comm = comm.Split(color=MPI.UNDEFINED, key=rank)
 
-    # Phase 2: 数据分发
+    # Phase 2: 通过Alltoallw将数据从I/O进程分发到所有进程
     sendcounts = numpy.zeros(comm_size, dtype=int)
     recvcounts = numpy.zeros(comm_size, dtype=int)
     sdispls = numpy.zeros(comm_size, dtype=int)
@@ -550,9 +571,11 @@ def readMPIFile(
     recvtypes = [MPI.BYTE] * comm_size
     
     local_data_size_bytes = numpy.prod(shape) * itemsize
+    # 每个进程从其对应的I/O leader接收数据
     recvcounts[my_io_leader] = local_data_size_bytes
 
     if is_io_proc:
+        # I/O进程向其负责的所有进程发送数据
         start_target_rank = my_io_group * procs_per_io_node
         for i in range(procs_per_io_node):
             target_rank = start_target_rank + i
