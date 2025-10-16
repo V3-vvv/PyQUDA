@@ -453,7 +453,7 @@ def readMPIFile(
 ) -> NDArray:
     """
     使用MPI聚合I/O策略并行读取文件。
-    少数进程(io_procs)负责读取大块数据，组内第一个进程作为 I/O leader，然后通过Alltoallw分发。
+    I/O进程负责读取其对应进程组的数据，然后通过Alltoallw分发。
 
     Parameters
     ----------
@@ -475,34 +475,50 @@ def readMPIFile(
     grid = getGridSize()
     comm_size = getMPISize()
 
-    if comm_size % io_procs != 0:
-        if rank == 0:
-            print(f"Error: Total processes ({comm_size}) must be divisible by I/O processes ({io_procs}).")
-        comm.Abort(1)
-
+    # 限制 io_procs 不超过总进程数
+    io_procs = min(io_procs, comm_size)
+    
     numpy_dtype = numpy.dtype(dtype)
     native_dtype_str = numpy_dtype.str.replace('>', '<') if numpy_dtype.str.startswith('>') else numpy_dtype.str
     native_dtype = numpy.dtype(native_dtype_str)
     itemsize = native_dtype.itemsize
 
-    # 计算每个I/O进程负责的普通进程数量
-    procs_per_io_node = comm_size // io_procs
+    # 简单分组：前面固定大小，最后一个包含剩余
+    base_group_size = comm_size // io_procs
+    last_group_start = (io_procs - 1) * base_group_size
     
-    # 每组的第一个进程作为I/O leader
-    is_io_proc = (rank % procs_per_io_node) == 0
-    my_io_group = rank // procs_per_io_node
-    my_io_leader = my_io_group * procs_per_io_node
+    # 计算当前进程所属的组
+    if rank < last_group_start:
+        my_io_group = rank // base_group_size
+        local_rank_in_group = rank % base_group_size
+        procs_in_my_group = base_group_size
+        my_io_leader = my_io_group * base_group_size
+    else:
+        my_io_group = io_procs - 1
+        my_io_leader = last_group_start
+        local_rank_in_group = rank - my_io_leader
+        procs_in_my_group = comm_size - last_group_start
+    
+    is_io_proc = (local_rank_in_group == 0)
+    
+    # 调试信息
+    if rank == 0:
+        last_group_size = comm_size - last_group_start
+        getLogger().info(f"Using {io_procs} I/O processes for {comm_size} total processes")
+        getLogger().info(f"First {io_procs - 1} groups: {base_group_size} processes each")
+        getLogger().info(f"Last group: {last_group_size} processes")
     
     send_buf = None
+    buf = numpy.empty(shape, dtype=native_dtype)
 
     if is_io_proc:
-        # Phase 1: I/O进程聚合读取数据
+        # Phase 1: I/O进程读取数据
         
         # 计算该I/O进程负责的进程组
-        group_ranks = [my_io_leader + i for i in range(procs_per_io_node)]
+        group_ranks = [my_io_leader + i for i in range(procs_in_my_group)]
         group_coords = [getCoordFromRank(r) for r in group_ranks]
         
-        # 根据组内进程的坐标范围计算聚合形状
+        # 根据组内所有进程的实际坐标范围计算聚合形状
         aggregator_shape = list(shape)
         min_coords = [min(coord[j] for coord in group_coords) for j in range(len(axes))]
         max_coords = [max(coord[j] for coord in group_coords) for j in range(len(axes))]
@@ -512,15 +528,15 @@ def readMPIFile(
         
         io_buf = numpy.empty(tuple(aggregator_shape), dtype=native_dtype)
         
-        # 创建MPI文件类型以描述在全局数组中的读取位置
+        # 创建MPI文件类型
         global_sizes = list(shape)
         for j, i in enumerate(axes):
             global_sizes[i] *= grid[j]
         
-        start_coords = getCoordFromRank(rank)
+        # 使用min_coords作为读取起点
         block_starts = [0] * len(shape)
         for j, i in enumerate(axes):
-            block_starts[i] = start_coords[j] * shape[i]
+            block_starts[i] = min_coords[j] * shape[i]
 
         filetype_dtype_base = dtlib.from_numpy_dtype(native_dtype)
         filetype = filetype_dtype_base.Create_subarray(global_sizes, tuple(aggregator_shape), block_starts)
@@ -539,7 +555,7 @@ def readMPIFile(
         filetype.Free()
 
         # 数据重排：根据目标进程的实际坐标从io_buf中提取对应数据
-        send_buf = numpy.empty(procs_per_io_node * numpy.prod(shape), dtype=native_dtype)
+        send_buf = numpy.empty(procs_in_my_group * numpy.prod(shape), dtype=native_dtype)
         
         for i, target_rank in enumerate(group_ranks):
             target_coords = getCoordFromRank(target_rank)
@@ -557,7 +573,7 @@ def readMPIFile(
             dest_start = i * numpy.prod(shape)
             dest_end = (i + 1) * numpy.prod(shape)
             
-            send_buf.ravel()[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
+            send_buf[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
     else:
         # 非I/O进程也需要参与Split以避免死锁
         io_comm = comm.Split(color=MPI.UNDEFINED, key=rank)
@@ -571,18 +587,15 @@ def readMPIFile(
     recvtypes = [MPI.BYTE] * comm_size
     
     local_data_size_bytes = numpy.prod(shape) * itemsize
-    # 每个进程从其对应的I/O leader接收数据
     recvcounts[my_io_leader] = local_data_size_bytes
 
     if is_io_proc:
-        # I/O进程向其负责的所有进程发送数据
-        start_target_rank = my_io_group * procs_per_io_node
-        for i in range(procs_per_io_node):
+        start_target_rank = my_io_group * base_group_size if my_io_group < io_procs - 1 else last_group_start
+        for i in range(procs_in_my_group):
             target_rank = start_target_rank + i
             sendcounts[target_rank] = local_data_size_bytes
             sdispls[target_rank] = i * local_data_size_bytes
             
-    buf = numpy.empty(shape, dtype=native_dtype)
     comm.Barrier()
     
     comm.Alltoallw(

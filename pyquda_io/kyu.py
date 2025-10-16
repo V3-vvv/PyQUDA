@@ -1,5 +1,5 @@
 from os import path
-from typing import List
+from typing import List, Optional
 
 import numpy
 
@@ -9,7 +9,7 @@ from .io_utils import propagatorFromDiracPauli, propagatorToDiracPauli
 Nd, Ns, Nc = 4, 4, 3
 
 
-def readGauge(filename: str, latt_size: List[int]):
+def readGauge(filename: str, latt_size: List[int], io_procs: Optional[int] = 16):
     filename = path.expanduser(path.expandvars(filename))
     Lx, Ly, Lz, Lt = getSublatticeSize(latt_size)
     dtype, offset = ">f8", 0
@@ -17,10 +17,12 @@ def readGauge(filename: str, latt_size: List[int]):
     # gauge = readMPIFile(filename, dtype, offset, (Nd, Nc, Nc, 2, Lt, Lz, Ly, Lx), (7, 6, 5, 4))
 
     # Test readMPIFile_aggregator
-    num_io_procs = 16 # Number of MPI processes to use for I/O
+    num_io_procs = io_procs
     comm_size = _MPI_COMM.Get_size()
-    if comm_size < num_io_procs:
+    if num_io_procs > comm_size:
+        print(f"Warning: Requested io_procs ({num_io_procs}) > MPI comm size ({comm_size}). Using {comm_size} instead.")
         num_io_procs = comm_size
+    
     gauge = readMPIFile(filename, dtype, offset, (Nd, Nc, Nc, 2, Lt, Lz, Ly, Lx), (7, 6, 5, 4), num_io_procs)
 
     gauge = (

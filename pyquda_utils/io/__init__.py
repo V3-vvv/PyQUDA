@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Union, Optional
 
 import numpy
 
@@ -94,10 +94,14 @@ def readMILCQIOPropagator(filename: str):
         return LatticeStaggeredPropagator(latt_info, latt_info.evenodd(propagator_raw, False))
 
 
-def readKYUGauge(filename: str, latt_size: List[int]):
+def readKYUGauge(filename: str, latt_size: List[int], io_procs: Optional[int] = None):
     from pyquda_io.kyu import readGauge as read
 
-    gauge_raw = read(filename, latt_size)
+    if io_procs is None:
+        gauge_raw = read(filename, latt_size)
+    else:
+        gauge_raw = read(filename, latt_size, io_procs=io_procs)
+    
     latt_info = LatticeInfo(latt_size)
     return LatticeGauge(latt_info, latt_info.evenodd(gauge_raw, True))
 
