@@ -449,11 +449,13 @@ def readMPIFile(
     offset: int,
     shape: Sequence[int],
     axes: Sequence[int],
-    io_procs: int
+    io_procs: int,
+    max_chunk_size: int = 2**30
 ) -> NDArray:
     """
     使用MPI聚合I/O策略并行读取文件。
-    I/O进程负责读取其对应进程组的数据，然后通过Alltoallw分发。
+    I/O进程负责读取其对应进程组的数据,然后通过Alltoallw分发。
+    支持分块传输以处理 sdispls 和 sendcounts 超过 2GB 限制的情况。
 
     Parameters
     ----------
@@ -469,13 +471,17 @@ def readMPIFile(
         需要跨进程分布的全局数组的轴。
     io_procs:
         用于I/O的聚合器进程数量。
+    max_chunk_size:
+        单次传输的最大字节数（默认1GB）。
     """
     comm = getMPIComm()
     rank = getMPIRank()
     grid = getGridSize()
     comm_size = getMPISize()
 
-    # 限制 io_procs 不超过总进程数
+    if rank == 0:
+        getLogger().info(f"Reading file {filename} with MPI aggregation I/O")
+
     io_procs = min(io_procs, comm_size)
     
     numpy_dtype = numpy.dtype(dtype)
@@ -483,11 +489,9 @@ def readMPIFile(
     native_dtype = numpy.dtype(native_dtype_str)
     itemsize = native_dtype.itemsize
 
-    # 简单分组：前面固定大小，最后一个包含剩余
     base_group_size = comm_size // io_procs
     last_group_start = (io_procs - 1) * base_group_size
     
-    # 计算当前进程所属的组
     if rank < last_group_start:
         my_io_group = rank // base_group_size
         local_rank_in_group = rank % base_group_size
@@ -501,24 +505,68 @@ def readMPIFile(
     
     is_io_proc = (local_rank_in_group == 0)
     
-    # 调试信息
+    local_data_size_bytes = int(numpy.prod(shape, dtype=numpy.int64) * itemsize)
+    max_displacement = (procs_in_my_group - 1) * local_data_size_bytes
+
+    # 计算安全的 chunk 大小，确保 sdispls 和 sendcounts/recvcounts 不超过 2GB 限制
+    MPI_DISP_LIMIT = 2**31 - 1
+    
+    need_send_chunking = max_displacement >= MPI_DISP_LIMIT
+    need_recv_chunking = local_data_size_bytes >= MPI_DISP_LIMIT
+    
+    # ========== 根据不同情况选择不同的分块策略 ==========
+    if need_send_chunking and not need_recv_chunking:
+        # 情况 1：只需要发送端分块
+        # 使用完整 buf + rdispls 指定偏移
+        use_recv_slice = False
+        safe_chunk_size = min(max_chunk_size, MPI_DISP_LIMIT // (procs_in_my_group - 1))
+        num_chunks = (local_data_size_bytes + safe_chunk_size - 1) // safe_chunk_size
+        use_chunking = True
+    elif need_recv_chunking:
+        # 情况 2：需要接收端分块
+        # 使用 buf 切片 + rdispls=0
+        use_recv_slice = True
+        if need_send_chunking:
+            # 同时需要发送端分块：取两者最小值
+            send_limit = MPI_DISP_LIMIT // (procs_in_my_group - 1)
+            recv_limit = MPI_DISP_LIMIT
+            safe_chunk_size = min(max_chunk_size, send_limit, recv_limit)
+        else:
+            # 只需要接收端分块
+            safe_chunk_size = min(max_chunk_size, MPI_DISP_LIMIT)
+        num_chunks = (local_data_size_bytes + safe_chunk_size - 1) // safe_chunk_size
+        use_chunking = True
+    else:
+        # 情况 3：不需要分块
+        use_recv_slice = False
+        use_chunking = False
+        num_chunks = 1
+        safe_chunk_size = local_data_size_bytes
+    # ================================================================
+    
     if rank == 0:
         last_group_size = comm_size - last_group_start
         getLogger().info(f"Using {io_procs} I/O processes for {comm_size} total processes")
         getLogger().info(f"First {io_procs - 1} groups: {base_group_size} processes each")
         getLogger().info(f"Last group: {last_group_size} processes")
+        getLogger().info(f"Local data size per process: {local_data_size_bytes / (1024**3):.2f} GB")
+        getLogger().info(f"Max displacement in I/O buffer: {max_displacement / (1024**3):.2f} GB")
+        if use_chunking:
+            getLogger().info(f"Need send chunking: {need_send_chunking}, Need recv chunking: {need_recv_chunking}")
+            getLogger().info(
+                f"Using chunked transfer: {num_chunks} chunks "
+                f"(safe chunk size: {safe_chunk_size / (1024**3):.2f} GB)"
+            )
+            getLogger().info(f"Using receive slice strategy: {use_recv_slice}")
     
     send_buf = None
-    buf = numpy.empty(shape, dtype=native_dtype)
+    buf = numpy.ascontiguousarray(numpy.empty(shape, dtype=native_dtype))
 
     if is_io_proc:
         # Phase 1: I/O进程读取数据
-        
-        # 计算该I/O进程负责的进程组
         group_ranks = [my_io_leader + i for i in range(procs_in_my_group)]
         group_coords = [getCoordFromRank(r) for r in group_ranks]
         
-        # 根据组内所有进程的实际坐标范围计算聚合形状
         aggregator_shape = list(shape)
         min_coords = [min(coord[j] for coord in group_coords) for j in range(len(axes))]
         max_coords = [max(coord[j] for coord in group_coords) for j in range(len(axes))]
@@ -528,12 +576,10 @@ def readMPIFile(
         
         io_buf = numpy.empty(tuple(aggregator_shape), dtype=native_dtype)
         
-        # 创建MPI文件类型
         global_sizes = list(shape)
         for j, i in enumerate(axes):
             global_sizes[i] *= grid[j]
         
-        # 使用min_coords作为读取起点
         block_starts = [0] * len(shape)
         for j, i in enumerate(axes):
             block_starts[i] = min_coords[j] * shape[i]
@@ -542,7 +588,6 @@ def readMPIFile(
         filetype = filetype_dtype_base.Create_subarray(global_sizes, tuple(aggregator_shape), block_starts)
         filetype.Commit()
 
-        # 创建I/O子通信器并读取数据
         io_comm = comm.Split(color=0 if is_io_proc else MPI.UNDEFINED, key=rank)
         
         if io_comm != MPI.COMM_NULL:
@@ -554,13 +599,11 @@ def readMPIFile(
         
         filetype.Free()
 
-        # 数据重排：根据目标进程的实际坐标从io_buf中提取对应数据
-        send_buf = numpy.empty(procs_in_my_group * numpy.prod(shape), dtype=native_dtype)
+        send_buf = numpy.ascontiguousarray(numpy.empty(procs_in_my_group * numpy.prod(shape), dtype=native_dtype))
         
         for i, target_rank in enumerate(group_ranks):
             target_coords = getCoordFromRank(target_rank)
             
-            # 计算目标进程在io_buf中的多维切片位置
             source_slice = []
             for dim in range(len(shape)):
                 if dim in axes:
@@ -575,33 +618,113 @@ def readMPIFile(
             
             send_buf[dest_start:dest_end] = io_buf[tuple(source_slice)].ravel()
     else:
-        # 非I/O进程也需要参与Split以避免死锁
         io_comm = comm.Split(color=MPI.UNDEFINED, key=rank)
 
-    # Phase 2: 通过Alltoallw将数据从I/O进程分发到所有进程
-    sendcounts = numpy.zeros(comm_size, dtype=int)
-    recvcounts = numpy.zeros(comm_size, dtype=int)
-    sdispls = numpy.zeros(comm_size, dtype=int)
-    rdispls = numpy.zeros(comm_size, dtype=int)
-    sendtypes = [MPI.BYTE] * comm_size
-    recvtypes = [MPI.BYTE] * comm_size
-    
-    local_data_size_bytes = numpy.prod(shape) * itemsize
-    recvcounts[my_io_leader] = local_data_size_bytes
+    if send_buf is None:
+        send_buf = numpy.empty(0, dtype=native_dtype)
 
-    if is_io_proc:
-        start_target_rank = my_io_group * base_group_size if my_io_group < io_procs - 1 else last_group_start
-        for i in range(procs_in_my_group):
-            target_rank = start_target_rank + i
-            sendcounts[target_rank] = local_data_size_bytes
-            sdispls[target_rank] = i * local_data_size_bytes
-            
     comm.Barrier()
     
-    comm.Alltoallw(
-        [send_buf, sendcounts, sdispls, sendtypes],
-        [buf, recvcounts, rdispls, recvtypes]
-    )
+    # Phase 2: 数据传输
+    if use_chunking:
+        # 分块传输
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * safe_chunk_size
+            chunk_end = min((chunk_idx + 1) * safe_chunk_size, local_data_size_bytes)
+            chunk_size = chunk_end - chunk_start
+
+            sendcounts = numpy.zeros(comm_size, dtype=numpy.int32)
+            recvcounts = numpy.zeros(comm_size, dtype=numpy.int32)
+            sdispls = numpy.zeros(comm_size, dtype=numpy.int32)
+            rdispls = numpy.zeros(comm_size, dtype=numpy.int32)
+            sendtypes = [MPI.BYTE] * comm_size
+            recvtypes = [MPI.BYTE] * comm_size
+
+            # ========== 根据策略设置接收端参数 ==========
+            recvcounts[my_io_leader] = chunk_size
+            if use_recv_slice:
+                # 策略 1：使用切片 + rdispls=0
+                rdispls[my_io_leader] = 0
+            else:
+                # 策略 2：使用完整 buf + rdispls=chunk_start
+                rdispls[my_io_leader] = chunk_start
+            # ===========================================
+
+            if is_io_proc:
+                send_buf_chunk = numpy.empty(procs_in_my_group * chunk_size, dtype=numpy.uint8)
+                
+                start_target_rank = my_io_group * base_group_size if my_io_group < io_procs - 1 else last_group_start
+                
+                for i in range(procs_in_my_group):
+                    target_rank = start_target_rank + i
+                    
+                    src_start = i * local_data_size_bytes + chunk_start
+                    src_end = i * local_data_size_bytes + chunk_start + chunk_size
+                    
+                    dst_start = i * chunk_size
+                    dst_end = (i + 1) * chunk_size
+                    
+                    send_buf_chunk[dst_start:dst_end] = send_buf.view(numpy.uint8)[src_start:src_end]
+                    
+                    sendcounts[target_rank] = chunk_size
+                    sdispls[target_rank] = i * chunk_size
+            else:
+                send_buf_chunk = numpy.empty(0, dtype=numpy.uint8)
+
+            if chunk_idx == 0 and is_io_proc and rank % 16 == 0:
+                max_sdispl = max(sdispls) if is_io_proc else 0
+                getLogger().info(
+                    f"I/O rank {rank}: chunk {chunk_idx+1}/{num_chunks}, "
+                    f"chunk_size={chunk_size/(1024**2):.1f}MB, "
+                    f"max_sdispl={max_sdispl/(1024**3):.2f}GB"
+                )
+
+            # ========== 根据策略选择接收 buffer ==========
+            if use_recv_slice:
+                # 策略 1：使用切片
+                buf_chunk = buf.view(numpy.uint8)[chunk_start:chunk_end]
+                comm.Alltoallw(
+                    [send_buf_chunk, sendcounts, sdispls, sendtypes],
+                    [buf_chunk, recvcounts, rdispls, recvtypes]
+                )
+            else:
+                # 策略 2：使用完整 buf
+                comm.Alltoallw(
+                    [send_buf_chunk, sendcounts, sdispls, sendtypes],
+                    [buf, recvcounts, rdispls, recvtypes]
+                )
+            # ===========================================
+    else:
+        # 不需要分块
+        sendcounts = numpy.zeros(comm_size, dtype=numpy.int32)
+        recvcounts = numpy.zeros(comm_size, dtype=numpy.int32)
+        sdispls = numpy.zeros(comm_size, dtype=numpy.int32)
+        rdispls = numpy.zeros(comm_size, dtype=numpy.int32)
+        sendtypes = [MPI.BYTE] * comm_size
+        recvtypes = [MPI.BYTE] * comm_size
+        
+        recvcounts[my_io_leader] = local_data_size_bytes
+
+        if is_io_proc:
+            start_target_rank = my_io_group * base_group_size if my_io_group < io_procs - 1 else last_group_start
+            for i in range(procs_in_my_group):
+                target_rank = start_target_rank + i
+                sendcounts[target_rank] = local_data_size_bytes
+                sdispls[target_rank] = i * local_data_size_bytes
+                
+            if rank % 16 == 0:
+                max_displ = numpy.max(sdispls[sdispls > 0]) if numpy.any(sdispls > 0) else 0
+                getLogger().info(
+                    f"I/O rank {rank}: group {my_io_group}, "
+                    f"procs={procs_in_my_group}, "
+                    f"local_data={local_data_size_bytes/(1024**2):.1f}MB, "
+                    f"max_displ={max_displ/(1024**3):.2f}GB"
+                )
+        
+        comm.Alltoallw(
+            [send_buf, sendcounts, sdispls, sendtypes],
+            [buf.view(numpy.uint8), recvcounts, rdispls, recvtypes]
+        )
 
     return buf.view(numpy_dtype)
 
